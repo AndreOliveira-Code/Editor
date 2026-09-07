@@ -935,6 +935,7 @@ input[type="text"]:focus,input[type="number"]:focus,select:focus,textarea:focus{
           <button class="btn btn-icon" id="ed-stop-btn" title="Voltar ao início"><i class="fas fa-stop"></i></button>
           <span id="ed-time-label" style="font-size:12px;color:var(--text-dim);min-width:104px;">00:00 / 00:00</span>
           <div class="playback-track" id="playback-track"><div class="playback-fill" id="playback-fill"></div></div>
+          <button class="btn btn-sm" id="live-toggle" title="Ligar/desligar a prévia ao vivo dos vídeos e efeitos"><i class="fas fa-play"></i> Prévia ao vivo</button>
           <button class="btn btn-sm" id="tl-split-btn" title="Dividir o clipe no cursor"><i class="fas fa-scissors"></i> Dividir</button>
           <button class="btn btn-sm" id="tl-addtrack-btn" title="Nova trilha"><i class="fas fa-plus"></i> Trilha</button>
           <span class="zoom-bar">
@@ -2934,16 +2935,23 @@ window.InviteEditor = (function(){
   let previewUntil = 0;   // performance.now() deadline
   let previewStart = 0;
   const PREVIEW_SECONDS = 5;
+  // videos and loop effects only animate while this is on. Off by default so the
+  // editor sits idle instead of decoding video forever in the background.
+  let livePreview = false;
   function startEffectPreview(){
     previewStart = performance.now();
     previewUntil = previewStart + PREVIEW_SECONDS*1000;
     editClock = 0;
     scheduleRender();
+    // when the 5s preview ends, stop decoding video again
+    setTimeout(()=>{ if (!livePreview && !playing){ pauseAllEditVideos(); scheduleRender(); } },
+              PREVIEW_SECONDS*1000 + 120);
   }
 
   // keep video elements actually playing while editing so they look like video
   function syncEditVideos(){
     if (playing) return;
+    if (!livePreview){ pauseAllEditVideos(); return; }
     getPage().elements.forEach(el=>{
       if (el.type!=='video' || el.hidden) return;
       const v = getMediaObj(el);
@@ -2959,6 +2967,14 @@ window.InviteEditor = (function(){
       }
       if (v.paused && v.readyState>=2) v.play().catch(()=>{});
     });
+  }
+  // stop every video on every page (frees decoders and CPU)
+  function pauseAllEditVideos(){
+    project.pages.forEach(pg=>pg.elements.forEach(el=>{
+      if (el.type!=='video') return;
+      const v = getMediaObj(el);
+      if (v && !v.paused) v.pause();
+    }));
   }
   function pageHasPlayingVideo(){
     return getPage().elements.some(el=>{
@@ -2977,7 +2993,7 @@ window.InviteEditor = (function(){
 
     syncEditVideos();
 
-    const loopFx = getPage().elements.some(e=>
+    const loopFx = livePreview && getPage().elements.some(e=>
       (e.loopAnim && e.loopAnim.type!=='none') ||
       (e.type==='text' && e.textAnim && LOOP_TEXT_FX.includes(e.textAnim.type))
     );
@@ -2988,6 +3004,10 @@ window.InviteEditor = (function(){
     editClock += dt;
     // during a preview we feed a real local time so entrance/exit effects play out
     const previewT = previewing ? (performance.now()-previewStart)/1000 : null;
+    if (!livePreview && !previewing){
+      const starts = pageStartTimes();
+      seekVideosTo(project.currentPageIndex, Math.max(0, playhead - (starts[project.currentPageIndex]||0)));
+    }
     renderPageToCtx(ctx, getPage(), canvas.width, canvas.height, previewT, editClock);
     updateElementsLayerTransforms();
     if (hasContinuousAnim) scheduleRender();
@@ -4819,6 +4839,7 @@ window.InviteEditor = (function(){
     $('#ed-play-btn').innerHTML = '<i class="fas fa-play"></i>';
     stopAudioPlayback();
     project.pages.forEach(p=>playAllPageVideos(p,false));
+    if (!livePreview) pauseAllEditVideos();
     $('#playback-fill').style.width='0%';
     playhead = 0; updatePlayhead();
     $('#ed-time-label').textContent = '00:00 / '+fmtTime(totalDuration());
@@ -5157,6 +5178,25 @@ window.InviteEditor = (function(){
 
   $('#tl-zoom').addEventListener('input', function(){ tlPps = parseFloat(this.value); renderTimeline(); });
 
+  function setLivePreview(on){
+    livePreview = !!on;
+    const btn = $('#live-toggle');
+    btn.innerHTML = livePreview ? '<i class="fas fa-pause"></i> Pausar prévia'
+                                : '<i class="fas fa-play"></i> Prévia ao vivo';
+    btn.classList.toggle('btn-ok', livePreview);
+    if (!livePreview){
+      pauseAllEditVideos();
+      previewUntil = 0;
+      renderAtPlayhead();
+      toast('Prévia pausada — vídeos e efeitos parados');
+    } else {
+      scheduleRender();
+      toast('Prévia ao vivo ligada');
+    }
+  }
+  $('#live-toggle').addEventListener('click', ()=>setLivePreview(!livePreview));
+  setLivePreview(false);
+
   $('#tl-addtrack-btn').addEventListener('click', ()=>{
     const el = selectedElementId ? findEl(selectedElementId) : null;
     if (!el){ toast('Selecione um clipe para mover para uma trilha nova', true); return; }
@@ -5309,7 +5349,10 @@ window.InviteEditor = (function(){
     if (!mime){ toast('Este navegador não suporta gravação de vídeo', true); return; }
     const isMp4 = mime.indexOf('mp4')===0 || mime.indexOf('video/mp4')===0;
     if (prefer==='mp4' && !isMp4){
-      toast('Seu navegador não grava MP4 — exportando em WEBM', true);
+      // never hand back a WebM pretending to be MP4: use the WebCodecs muxer
+      exporting = false;
+      toast('MediaRecorder sem MP4 neste navegador — usando o codificador WebCodecs', true);
+      return exportMp4WebCodecs();
     }
     exporting = true;
     const FPS = 30;
@@ -5318,7 +5361,10 @@ window.InviteEditor = (function(){
     try{
       await primeVideosForExport();
       const W = project.canvasW, H = project.canvasH;
-      const stream = canvas.captureStream(0);
+      // Automatic sampling at FPS. Relying only on requestFrame() made some browsers
+      // record a single frame -> the "static video" bug. Automatic capture combined
+      // with real-time pacing records motion reliably everywhere.
+      const stream = canvas.captureStream(FPS);
       recordTrack = stream.getVideoTracks()[0];
 
       // mix every audio track (music + voice) into the recording
@@ -5361,6 +5407,7 @@ window.InviteEditor = (function(){
       for (let i=0;i<frames;i++){
         const t = i/FPS;
         renderAbsoluteTime(ctx, W, H, t);
+        if (recordTrack && recordTrack.requestFrame){ try{ recordTrack.requestFrame(); }catch(e){} }
         gainMap.forEach(({tr,g})=>{
           try{ g.gain.value = trackGainAt(tr, t); }catch(e){}
           seekTrackTo(tr, t);
@@ -5585,7 +5632,211 @@ window.InviteEditor = (function(){
     }
   }
 
-  $('#exp-mp4').addEventListener('click', ()=>exportVideo('mp4'));
+
+  // ============================================================
+  //  MP4 export via WebCodecs + a self-contained MP4 muxer.
+  //  MediaRecorder is unreliable (and often refuses MP4), so we encode
+  //  frame-by-frame and build the container ourselves. No external library.
+  // ============================================================
+  function mp4Box(type, ...payload){
+    let len = 8;
+    payload.forEach(p=>{ len += p.length; });
+    const head = new Uint8Array(8);
+    new DataView(head.buffer).setUint32(0, len);
+    for (let i=0;i<4;i++) head[4+i] = type.charCodeAt(i);
+    const out = new Uint8Array(len);
+    out.set(head, 0);
+    let off = 8;
+    payload.forEach(p=>{ out.set(p, off); off += p.length; });
+    return out;
+  }
+  function u8(...v){ return new Uint8Array(v); }
+  function u16(v){ const a=new Uint8Array(2); new DataView(a.buffer).setUint16(0,v); return a; }
+  function u32(v){ const a=new Uint8Array(4); new DataView(a.buffer).setUint32(0,v>>>0); return a; }
+  function concatU8(arrs){
+    let n=0; arrs.forEach(a=>n+=a.length);
+    const out=new Uint8Array(n); let o=0;
+    arrs.forEach(a=>{ out.set(a,o); o+=a.length; });
+    return out;
+  }
+  function strBytes(s){ const a=new Uint8Array(s.length); for(let i=0;i<s.length;i++) a[i]=s.charCodeAt(i); return a; }
+
+  // minimal vpcC for VP9 (used when H.264 is unavailable in the browser)
+  function vpcCBox(){
+    return mp4Box('vpcC', u8(1,0,0,0), u8(0 /*profile*/, 41 /*level 4.1*/, (8<<4)|(1<<1)|1 /*bitDepth|chroma|fullRange*/),
+                  u8(2 /*colourPrimaries BT709*/, 2 /*transfer*/, 2 /*matrix*/), u16(0));
+  }
+  function avcCBox(desc){ return mp4Box('avcC', new Uint8Array(desc)); }
+
+  function buildMp4(samples, cfg){
+    // samples: [{data:Uint8Array, key:bool}] in presentation order
+    const { width, height, fps, codec, description } = cfg;
+    const isAvc = codec.indexOf('avc1')===0;
+    const timescale = fps;                 // 1 tick = 1 frame
+    const nSamples = samples.length;
+    const mdatPayload = concatU8(samples.map(s=>s.data));
+    const mdat = mp4Box('mdat', mdatPayload);
+
+    const ftyp = mp4Box('ftyp', strBytes(isAvc?'isom':'isom'), u32(512),
+                        strBytes('isom'), strBytes('iso2'), strBytes(isAvc?'avc1':'mp41'), strBytes('mp41'));
+
+    // sample tables
+    const stts = mp4Box('stts', u32(0), u32(1), u32(nSamples), u32(1));
+    const stsz = mp4Box('stsz', u32(0), u32(0), u32(nSamples), concatU8(samples.map(s=>u32(s.data.length))));
+    const stsc = mp4Box('stsc', u32(0), u32(1), u32(1), u32(nSamples), u32(1));
+    const keyIdx = [];
+    samples.forEach((s,i)=>{ if (s.key) keyIdx.push(i+1); });
+    const stss = mp4Box('stss', u32(0), u32(keyIdx.length), concatU8(keyIdx.map(u32)));
+
+    const codecBox = isAvc ? avcCBox(description) : vpcCBox();
+    const entryName = isAvc ? 'avc1' : 'vp09';
+    const visual = mp4Box(entryName,
+      u8(0,0,0,0,0,0), u16(1),                       // reserved + data_ref_index
+      u16(0), u16(0), u32(0),                        // pre_defined / reserved
+      u32(0), u32(0),
+      u16(width), u16(height),
+      u32(0x00480000), u32(0x00480000),              // 72dpi
+      u32(0), u16(1),
+      new Uint8Array(32),                            // compressor name
+      u16(0x0018), u16(0xFFFF),
+      codecBox
+    );
+    const stsd = mp4Box('stsd', u32(0), u32(1), visual);
+
+    // the single chunk sits right after the mdat header, and ftyp is already
+    // built, so the offset is known up-front — no patching guesswork needed
+    const chunkOffset = ftyp.length + 8;
+    const stco = mp4Box('stco', u32(0), u32(1), u32(chunkOffset));
+    const stbl = mp4Box('stbl', stsd, stts, stss, stsc, stsz, stco);
+    const vmhd = mp4Box('vmhd', u32(1), u16(0), u16(0), u16(0), u16(0));
+    const dref = mp4Box('dref', u32(0), u32(1), mp4Box('url ', u32(1)));
+    const dinf = mp4Box('dinf', dref);
+    const minf = mp4Box('minf', vmhd, dinf, stbl);
+    const mdhd = mp4Box('mdhd', u32(0), u32(0), u32(0), u32(timescale), u32(nSamples), u16(0x55c4), u16(0));
+    const hdlr = mp4Box('hdlr', u32(0), u32(0), strBytes('vide'), u32(0), u32(0), u32(0), strBytes('VideoHandler\0'));
+    const mdia = mp4Box('mdia', mdhd, hdlr, minf);
+    const tkhd = mp4Box('tkhd', u8(0,0,0,3), u32(0), u32(0), u32(1), u32(0), u32(nSamples),
+      new Uint8Array(8), u16(0), u16(0), u16(0), u16(0),
+      concatU8([u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000)]),
+      u32(width<<16), u32(height<<16));
+    const trak = mp4Box('trak', tkhd, mdia);
+    const mvhd = mp4Box('mvhd', u32(0), u32(0), u32(0), u32(timescale), u32(nSamples),
+      u32(0x00010000), u16(0x0100), u16(0), u32(0), u32(0),
+      concatU8([u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000)]),
+      new Uint8Array(24), u32(2));
+    const moov = mp4Box('moov', mvhd, trak);
+
+    // layout: ftyp | mdat | moov
+    return new Blob([ftyp, mdat, moov], { type:'video/mp4' });
+  }
+
+  async function pickWebCodec(W,H,fps){
+    if (typeof VideoEncoder === 'undefined') return null;
+    const tries = [
+      { codec:'avc1.42002A', avc:{format:'avc'} },
+      { codec:'avc1.42001f', avc:{format:'avc'} },
+      { codec:'avc1.4D401F', avc:{format:'avc'} },
+      { codec:'avc1.640028', avc:{format:'avc'} },
+      { codec:'vp09.00.10.08' }
+    ];
+    for (const t of tries){
+      const conf = Object.assign({
+        width:W, height:H, framerate:fps,
+        bitrate: Math.min(12000000, Math.max(2500000, Math.round(W*H*fps*0.11)))
+      }, t);
+      try{
+        const s = await VideoEncoder.isConfigSupported(conf);
+        if (s && s.supported) return conf;
+      }catch(e){}
+    }
+    return null;
+  }
+
+  async function exportMp4WebCodecs(){
+    if (exporting){ toast('Já existe uma exportação em andamento', true); return; }
+    if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined'){
+      toast('Este navegador não tem WebCodecs — use o Chrome/Edge atualizado, ou exporte GIF', true);
+      return;
+    }
+    if (!window.isSecureContext){
+      toast('MP4 exige página em https:// ou localhost (WebCodecs). Abra pelo endereço do GitHub Pages.', true);
+      return;
+    }
+    exporting = true;
+    const FPS = 30;
+    // even dimensions are required by H.264
+    const W = Math.max(2, Math.round(project.canvasW/2)*2);
+    const H = Math.max(2, Math.round(project.canvasH/2)*2);
+    const total = totalDuration();
+    const frames = Math.max(1, Math.round(total*FPS));
+    try{
+      const conf = await pickWebCodec(W,H,FPS);
+      if (!conf) throw new Error('nenhum codec de vídeo disponível no navegador');
+      await primeVideosForExport();
+
+      const samples = [];
+      let description = null;
+      let encErr = null;
+      const encoder = new VideoEncoder({
+        output: (chunk, meta)=>{
+          if (meta && meta.decoderConfig && meta.decoderConfig.description && !description){
+            description = meta.decoderConfig.description;
+          }
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
+          samples.push({ data: buf, key: chunk.type === 'key' });
+        },
+        error: e=>{ encErr = e; }
+      });
+      encoder.configure(conf);
+
+      const work = document.createElement('canvas');
+      work.width = W; work.height = H;
+      const wctx = work.getContext('2d');
+
+      for (let i=0;i<frames;i++){
+        if (encErr) throw encErr;
+        const t = i/FPS;
+        renderAbsoluteTime(ctx, project.canvasW, project.canvasH, t);
+        wctx.clearRect(0,0,W,H);
+        wctx.drawImage(canvas, 0, 0, W, H);
+        const frame = new VideoFrame(work, { timestamp: Math.round(i*1e6/FPS), duration: Math.round(1e6/FPS) });
+        encoder.encode(frame, { keyFrame: i % FPS === 0 });
+        frame.close();
+        if (i % 6 === 0){
+          setExportProgress('Codificando MP4 '+Math.round(i/frames*100)+'%');
+          $('#playback-fill').style.width = (i/frames*100)+'%';
+          await new Promise(r=>setTimeout(r,0));       // let the encoder breathe
+        }
+      }
+      setExportProgress('Finalizando MP4...');
+      await encoder.flush();
+      encoder.close();
+      if (encErr) throw encErr;
+      if (!samples.length) throw new Error('o codificador não produziu nenhum quadro');
+      if (conf.codec.indexOf('avc1')===0 && !description) throw new Error('faltou o cabeçalho avcC do codificador');
+
+      const blob = buildMp4(samples, { width:W, height:H, fps:FPS, codec:conf.codec, description });
+      const url = URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download='convite.mp4'; a.click();
+      setTimeout(()=>URL.revokeObjectURL(url), 6000);
+      const isAvc = conf.codec.indexOf('avc1')===0;
+      toast('MP4 exportado ('+(isAvc?'H.264':'VP9')+', '+samples.length+' quadros, '+(blob.size/1048576).toFixed(1)+' MB)');
+      if (!isAvc){
+        setTimeout(()=>toast('Seu navegador não tem H.264; saiu VP9 dentro do MP4. Se não abrir, use o GIF.', true), 1400);
+      }
+    } catch(err){
+      console.error(err);
+      toast('Falha no MP4: '+(err && err.message ? err.message : 'erro')+' — tente o GIF', true);
+    } finally {
+      exporting = false;
+      $('#playback-fill').style.width='0%';
+      setExportProgress('00:00 / '+fmtTime(totalDuration()));
+      scheduleRender();
+    }
+  }
+
+  $('#exp-mp4').addEventListener('click', exportMp4WebCodecs);
   $('#exp-webm').addEventListener('click', ()=>exportVideo('webm'));
   $('#exp-gif').addEventListener('click', exportGif);
 
